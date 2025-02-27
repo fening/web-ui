@@ -45,9 +45,16 @@ from src.utils.agent_interaction import (
     InteractionType
 )
 from src.utils.terminal_interaction import terminal_handler
+from src.utils.agent_control import agent_control_manager
+from src.utils.notification_manager import notification_manager, NotificationLevel 
+from src.utils.agent_command import agent_command_manager
+from src.utils.guided_interface import guided_process_manager, GuidedStep, StepStatus
+from src.utils.terminal_command_input import terminal_command_input
+from src.utils.keyboard_handler import keyboard_handler  # Add this import
 
 from .custom_massage_manager import CustomMassageManager
 from .custom_views import CustomAgentOutput, CustomAgentStepInfo
+from .task_hints.job_search import JOB_SEARCH_HINTS
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +132,11 @@ class CustomAgent(Agent):
         self.max_scroll_attempts = 5  # Maximum number of scroll attempts per page
         self.enable_user_interaction = enable_user_interaction
         self.waiting_for_user_input = False
+
+        # Generate agent ID early if not already set
+        if not hasattr(self, 'agent_id'):
+            self.agent_id = str(uuid.uuid4())
+            logger.debug(f"Agent ID generated: {self.agent_id}")
 
     def _setup_action_models(self) -> None:
         """Setup dynamic action models from controller's registry"""
@@ -211,6 +223,14 @@ class CustomAgent(Agent):
     async def step(self, step_info: Optional[CustomAgentStepInfo] = None) -> None:
         """Execute one step of the task"""
         logger.info(f"\n📍 Step {self.n_steps}")
+        
+        # Check if we should pause here
+        if self.agent_id:
+            await agent_control_manager.check_and_wait_if_paused(self.agent_id)
+            
+            # Process any pending commands
+            await agent_command_manager.process_commands(self.agent_id, self)
+        
         state = None
         model_output = None
         result: list[ActionResult] = []
@@ -241,6 +261,26 @@ class CustomAgent(Agent):
                 if step_info and hasattr(step_info, "memory"):
                     step_info.memory += "Remember: Search results often continue below the visible area. Consider scrolling down to see all results.\n"
             
+            # Add job search hints if this appears to be a job search task
+            task_lower = self.task.lower()
+            if (
+                "job" in task_lower and 
+                any(term in task_lower for term in ["search", "find", "look", "apply"])
+            ) or (
+                state and "linkedin.com/jobs" in state.url
+            ):
+                if step_info and hasattr(step_info, "memory"):
+                    if "JOB_SEARCH_HINTS" not in step_info.memory:  # Only add once
+                        step_info.memory += JOB_SEARCH_HINTS + "\n"
+                        logger.info("📋 Added job search hints to memory")
+                        
+                        # Check if location is specified in task
+                        import re
+                        location_match = re.search(r'in\s+([A-Za-z\s,.]+)', task_lower)
+                        if location_match:
+                            target_location = location_match.group(1).strip()
+                            step_info.memory += f"\nIMPORTANT: User is specifically looking for jobs in {target_location}. Focus ONLY on jobs in this location.\n"
+
             self.message_manager.add_state_message(state, self._last_result, step_info)
             input_messages = self.message_manager.get_messages()
             model_output = await self.get_next_action(input_messages)
@@ -336,6 +376,13 @@ class CustomAgent(Agent):
                     )
             if state:
                 self._make_history_item(model_output, state, result)
+        
+        # Process guided step progress
+        self._update_guided_process(state, model_output, step_info)
+
+        # At the end of step, check again for pause
+        if self.agent_id:
+            await agent_control_manager.check_and_wait_if_paused(self.agent_id)
 
     async def _force_page_scroll(self, state) -> list[ActionResult]:
         """Force a page scroll when full page exploration is needed"""
@@ -617,6 +664,35 @@ class CustomAgent(Agent):
         try:
             logger.info(f"🚀 Starting task: {self.task}")
             
+            # Ensure agent_id is set (should be from parent class constructor)
+            if not hasattr(self, 'agent_id'):
+                self.agent_id = str(uuid.uuid4())
+                logger.debug(f"Agent ID generated in run(): {self.agent_id}")
+            
+            # If agent state exists, set the agent ID
+            if self.agent_state:
+                self.agent_state.set_agent_id(self.agent_id)
+            
+            # Start both terminal commands and keyboard shortcuts
+            terminal_command_input.set_agent_id(self.agent_id)
+            terminal_command_input.set_agent_state(self.agent_state)
+            terminal_command_input.start()
+            
+            # Configure and start keyboard shortcuts handler
+            keyboard_handler.set_active_agent(self.agent_id)
+            keyboard_handler.agent_state = self.agent_state
+            keyboard_handler.start()
+            
+            # Log agent ID for debugging
+            logger.info(f"Agent running with ID: {self.agent_id}")
+            
+            # Notify task start
+            notification_manager.info(
+                message=f"Started task: {self.task}",
+                title="Agent Started",
+                details=f"Agent ID: {self.agent_id}"
+            )
+            
             # Fix the telemetry event to only include supported parameters
             self.telemetry.capture(
                 AgentRunTelemetryEvent(
@@ -637,11 +713,16 @@ class CustomAgent(Agent):
             )
 
             for step in range(max_steps):
-                # 1) Check if stop requested
+                # 1) Check for stop or pause
                 if self.agent_state and self.agent_state.is_stop_requested():
                     logger.info("🛑 Stop requested by user")
+                    notification_manager.warning("Agent stopped by user", title="Agent Stopped")
                     self._create_stop_history_item()
                     break
+                    
+                # Check for pause at the loop level
+                if self.agent_id:
+                    await agent_control_manager.check_and_wait_if_paused(self.agent_id)
 
                 # 2) Store last valid state before step
                 if self.browser_context and self.agent_state:
@@ -666,8 +747,30 @@ class CustomAgent(Agent):
             else:
                 logger.info("❌ Failed to complete task in maximum steps")
 
+            # Notify completion
+            if self.history.is_done():
+                notification_manager.success(
+                    message="Task completed successfully",
+                    title="Task Complete"
+                )
+            else:
+                notification_manager.warning(
+                    message="Task did not complete in the allowed steps",
+                    title="Task Incomplete"
+                )
+                
             return self.history
+        except Exception as e:
+            notification_manager.error(
+                message=f"Error during task execution: {str(e)}",
+                title="Task Error"
+            )
+            raise
         finally:
+            # Stop the terminal command input listener and keyboard handler
+            terminal_command_input.stop()
+            # We don't stop keyboard_handler here as it's global
+            
             self.telemetry.capture(
                 AgentEndTelemetryEvent(
                     agent_id=self.agent_id,
@@ -754,3 +857,43 @@ class CustomAgent(Agent):
         on_results_page = state and any(x in state.url.lower() for x in ["search", "results", "list"])
         
         return needs_full_page or on_results_page
+
+    def _update_guided_process(self, state, model_output, step_info):
+        """Update guided process status based on agent progress"""
+        # Get active process if any
+        active_process = guided_process_manager.get_active_process()
+        if not active_process:
+            return
+            
+        # Get current step
+        current_step = active_process.get_current_step()
+        if not current_step:
+            return
+        
+        # Check for step completion conditions
+        if current_step.status == StepStatus.IN_PROGRESS:
+            # Example logic - customize based on your step completion needs
+            if model_output and hasattr(model_output, "current_state"):
+                # Check if the step's completion indicators are in the thoughts
+                thought = model_output.current_state.thought.lower() if model_output.current_state.thought else ""
+                progress = model_output.current_state.completed_contents.lower() if model_output.current_state.completed_contents else ""
+                
+                # Get step title words for matching
+                step_keywords = set([w.lower() for w in current_step.title.split() if len(w) > 3])
+                
+                # Check if step is referenced as complete
+                step_mentioned = any(kw in thought or kw in progress for kw in step_keywords)
+                completion_words = ["done", "completed", "finished", "success", "achieved"]
+                completion_mentioned = any(word in thought or word in progress for word in completion_words)
+                
+                if step_mentioned and completion_mentioned:
+                    if active_process.auto_advance:
+                        # Auto-advance to the next step
+                        active_process.advance_to_next_step()
+                        logger.info(f"Guided process automatically advanced to step {active_process.current_step_index + 1}")
+                    
+                    notification_manager.info(
+                        message=f"Step completed: {current_step.title}",
+                        title="Step Progress",
+                        details=f"Guided process: {active_process.name}"
+                    )
