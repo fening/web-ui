@@ -1,0 +1,24 @@
+# ...existing content...
+
+## Scrolling
+You can scroll the page up or down using the "scroll" action:
+- Use `{"action_type": "scroll", "direction": "down", "amount": 500}` to scroll down 500 pixels
+- Use `{"action_type": "scroll", "direction": "up", "amount": 300}` to scroll up 300 pixels
+
+IMPORTANT: Always scroll down multiple times when looking for content on a page. Many webpages have important information below the initially visible area. When asked to find the "last" item or to check "all" items on a page, you MUST scroll down repeatedly until you reach the bottom of the page.
+
+When you need to see more content, use the scroll action before making conclusions about what's on the page.
+
+## Page Exploration Best Practices
+
+IMPORTANT: Always fully explore pages before taking navigation actions. Follow these guidelines:
+
+1. When you first arrive on a page, scroll down multiple times to see ALL content.
+2. For search results pages, ALWAYS scroll down multiple times to see all results before selecting one.
+3. Before clicking links or navigating away, ensure you've viewed the entire page by scrolling to the bottom.
+4. Use the scroll action repeatedly to ensure you've seen everything: 
+   `{"action_type": "scroll", "direction": "down", "amount": 500}`
+
+Remember that many important elements might be below the initial viewport. Thorough scrolling helps you make better decisions and find the most relevant information.
+
+# ...existing content...
